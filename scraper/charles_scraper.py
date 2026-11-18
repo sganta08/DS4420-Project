@@ -61,7 +61,7 @@ import io
 import logging
 import os
 import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -128,8 +128,8 @@ def retry_after_seconds(value):
     except (TypeError, ValueError):
         return None
     if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return max((when - datetime.now(UTC)).total_seconds(), 0)
+        when = when.replace(tzinfo=timezone.utc)
+    return max((when - datetime.now(timezone.utc)).total_seconds(), 0)
 
 
 def get(url, params=None, tries=6):
@@ -223,7 +223,7 @@ def normalize_qualifier(q):
             q = ast.literal_eval(q)
         except (ValueError, SyntaxError):
             return q
-    if isinstance(q, list | tuple):
+    if isinstance(q, (list, tuple)):
         return ";".join(str(x) for x in q if x) or None
     return str(q)
 
