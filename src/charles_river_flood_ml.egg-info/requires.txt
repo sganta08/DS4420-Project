@@ -1,0 +1,8 @@
+requests
+pandas
+numpy
+
+[dev]
+pytest
+responses
+ruff
