@@ -12,29 +12,29 @@ which one you used.
 
 | File | One row per | Coverage | Use for |
 |---|---|---|---|
-| `daily_merged.csv` | calendar day | 1931-08-04 → refresh date | all models |
-| `hourly_flow.csv` | UTC hour that has readings | discharge from 1989 (plus 4 days in Feb 1976); gage height from 2007-10-01 | LSTM at sub-daily resolution, flood peaks |
+| `daily_merged.csv` | calendar day | 1931-08-04 → last day with an official daily mean (refresh date − 1) | all models |
+| `hourly_flow.csv` | UTC hour (complete grid, no skipped hours) | 1990-10-01 → refresh time; gage height from 2007-10-01 | LSTM at sub-daily resolution, flood peaks |
 | `usgs_peaks.csv` | annual peak event | water years 1932 → last complete year | Bayesian exceedance model |
 
 ### `daily_merged.csv`
 
-Dates are full outer joins, so a day appears if *any* source has data. A blank cell means no data.
+Every calendar day is present, with no duplicates. `discharge_cfs_mean` (the target) has no blanks.
+A blank cell in any other column means no data.
 
 | Column | Units | Notes |
 |---|---|---|
 | `date` | YYYY-MM-DD | |
 | `discharge_cfs_mean` | ft³/s | Official USGS daily mean discharge, the main **target** |
 | `discharge_approval` | | `Approved` (final) or `Provisional` (recent data, may be revised) |
-| `discharge_qualifier` | | e.g. `ICE` (ice-affected, so discharge is estimated), `ESTIMATED`. Several qualifiers are joined with `;` |
-| `precip_in` | inches | Daily precipitation at Logan |
+| `discharge_qualifier` | | Blank for measured values. `ESTIMATED` (58 days) means USGS estimated the value, mostly for winter ice (Jan–Feb) or equipment outages. Several qualifiers would be joined with `;` |
+| `precip_in` | inches | Daily precipitation at Logan. Weather starts 1936-01-01; 7 later days are blank |
 | `snowfall_in` | inches | |
-| `snow_depth_in` | inches | Often blank in recent years |
-| `tmax_f`, `tmin_f` | °F | |
-| `tavg_f` | °F | Sparse; if missing, use `(tmax_f + tmin_f) / 2` |
-| `wind_mph` | mph | Average daily wind; missing in early decades |
+| `tmax_f`, `tmin_f` | °F | 3 days in 1938–43 where Tmax < Tmin (NOAA source error) are blanked |
+| `tmean_f` | °F | `(tmax_f + tmin_f) / 2`. Use this as the daily temperature |
+| `wind_mph` | mph | Average daily wind. **Starts 1984-01-01** (blank before), so only use it for models trained on 1984+ |
 | `precip_trace` | bool | `True` = trace precipitation (recorded as 0.00) |
-| `discharge_cfs_15min_max`, `_mean` | ft³/s | Daily max/mean of 15-min readings. Good for flood peaks |
-| `gage_height_ft_15min_max`, `_mean` | ft | Daily max/mean river stage. Flood thresholds are defined on stage |
+| `discharge_cfs_15min_max`, `_mean` | ft³/s | Daily max/mean of 15-min readings, good for flood peaks. Only filled for days with ≥ 20 hours of readings. Continuous from 1990-10-01; before that only Feb 1976 (4 days), Jul 1988 (a few days) and Oct 1988 – Sep 1989 |
+| `gage_height_ft_15min_max`, `_mean` | ft | Daily max/mean river stage, from 2007-10-01. Flood thresholds are defined on stage. Same ≥ 20 h rule |
 | `month` | 1–12 | |
 | `doy_sin`, `doy_cos` | | Day-of-year on a 365.25-day cycle (season / snowmelt signal) |
 | `water_year` | | Oct 1 – Sep 30; Oct–Dec belong to the next year |
@@ -45,19 +45,28 @@ gauge's local day.
 
 ### `hourly_flow.csv`
 
-`time_utc`, `discharge_cfs_mean`, `discharge_cfs_max`, `gage_height_ft_mean`,
-`gage_height_ft_max`. Hours without readings are left out, so check for time jumps
-before building fixed-length sequences.
+| Column | Units | Notes |
+|---|---|---|
+| `time_utc` | ISO timestamp, UTC | One row for every hour. No hours are skipped |
+| `discharge_cfs_mean`, `discharge_cfs_max` | ft³/s | Mean/max of the readings in that hour |
+| `gage_height_ft_mean`, `gage_height_ft_max` | ft | Blank before 2007-10-01 |
+| `discharge_cfs_filled`, `gage_height_ft_filled` | bool | `True` = gap of ≤ 6 h filled by linear interpolation, not measured |
+
+Gaps longer than 6 hours stay blank: 15 discharge gaps, 1,163 hours in all, the longest
+432 h (18 days, Feb 2002). Split sequences at blanks, or drop windows that contain one.
+The 1976 and 1988–89 fragments are only in `daily_merged.csv`, to keep this file continuous.
 
 ### `usgs_peaks.csv`
 
 `parameter_code` is `00060` for a discharge peak (ft³/s) or `00065` for a stage peak
-(ft); **filter on it**. Other columns: `time` (date of peak), `value`,
+(ft); **filter on it**. pandas reads it as the integer `60` / `65`, unless you pass `dtype={"parameter_code": str}`. Other columns: `time` (date of peak), `value`,
 `unit_of_measure`, `qualifier`, `water_year`, `time_of_day`, `peak_since`, `last_modified`.
 
 ## Caveats
 - Recent months are **Provisional** and USGS revises them. Consider excluding or
   down-weighting them when evaluating.
-- `ICE`-qualified winter discharge is estimated, not measured.
+- `ESTIMATED` winter discharge (ice) is estimated, not measured. Consider dropping or down-weighting it.
 - Logan (on the coast) is about 15 km from the Waltham gauge, so its weather is a proxy for the watershed.
-- NOAA data lags real time by a few days, so the newest rows have flow but no weather.
+- NOAA data lags real time by a few days, so the newest ~4 rows have flow but no weather.
+- Not included (still in `data/raw/`): NOAA `TAVG` (only 1998–2005, with bogus 0 °F days) and
+  `SNWD` snow depth (ends 2004-11-30).

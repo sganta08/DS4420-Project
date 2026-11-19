@@ -23,8 +23,9 @@ API behavior verified 2026-11-18:
     paginate by following links[rel=next].href (opaque cursor); max limit = 50000.
   * USGS `qualifier` is a JSON list (e.g. ["ICE"]) or null -> stored as "ICE;EST".
   * X-RateLimit-Remaining is only sent when an API key is used.
-  * 15-min discharge (00060): 4 days in Feb 1976, none 1977-1988, data from 1989.
-    15-min gage height (00065) starts 2007-10-01.
+  * 15-min discharge (00060): 4 days in Feb 1976, a few in Jul 1988, Oct 1988-Sep 1989,
+    none Oct 1989-Sep 1990, continuous from 1990-10-01. Gage height (00065) from 2007-10-01.
+  * USGS uses ESTIMATED (not ICE) for this gauge's ice-affected winter days.
   * Peaks collection mixes discharge (00060) and stage (00065) peaks; no approval_status.
   * NCEI returns HTTP 200 with an empty body OR a header-only CSV outside the record.
     PRCP_ATTRIBUTES first field "T" = trace precipitation (stored as 0.00).
@@ -50,7 +51,7 @@ Outputs (data/ is git-ignored; override location with DATA_DIR)
   data/raw/usgs_peaks.csv
   data/raw/noaa_logan_daily.csv
   data/processed/daily_merged.csv        (one row per day: flow + weather + season)
-  data/processed/hourly_flow.csv         (hourly mean/max discharge & stage, UTC)
+  data/processed/hourly_flow.csv         (complete hourly UTC grid from 1990-10-01, gaps <= 6 h filled)
 """
 
 from __future__ import annotations
@@ -93,11 +94,19 @@ PEAKS_KEEP = ["parameter_code", "time", "value", "unit_of_measure", "qualifier",
               "water_year", "time_of_day", "peak_since", "last_modified"]
 DAILY_COLUMNS = [
     "date", "discharge_cfs_mean", "discharge_approval", "discharge_qualifier",
-    "precip_in", "snowfall_in", "snow_depth_in", "tmax_f", "tmin_f", "tavg_f", "wind_mph",
+    "precip_in", "snowfall_in", "tmax_f", "tmin_f", "tmean_f", "wind_mph",
     "precip_trace", "discharge_cfs_15min_max", "discharge_cfs_15min_mean",
     "gage_height_ft_15min_max", "gage_height_ft_15min_mean",
     "month", "doy_sin", "doy_cos", "water_year",
 ]
+# Not shared: TAVG (only 1998-2005, contains bogus 0 F days) and SNWD (ends 2004-11-30).
+# They stay in data/raw/noaa_logan_daily.csv.
+DROP_WEATHER = ["tavg_f", "snow_depth_in"]
+
+# Cleaning rules for the processed tables
+MIN_HOURS_PER_DAY = 20         # 15-min daily max/mean only for days with >= 20 h of readings
+HOURLY_START = "1990-10-01"    # hourly grid starts at WY1991: continuous record from here
+MAX_FILL_HOURS = 6             # hourly gaps up to this long are linearly interpolated
 
 # GHCN-Daily days at first-order stations run midnight-to-midnight local *standard*
 # time, so we aggregate USGS sub-daily data on the same clock (UTC-5, no DST).
@@ -325,7 +334,8 @@ def read_raw(fname):
     if not p.exists():
         return pd.DataFrame()
     try:
-        return pd.read_csv(p, dtype={"qualifier": str, "approval_status": str})
+        return pd.read_csv(p, dtype={"qualifier": str, "approval_status": str},
+                           low_memory=False)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
 
@@ -345,6 +355,31 @@ def weather_frame(wx):
             trace[pd.to_numeric(wx["PRCP"], errors="coerce").isna()] = pd.NA
         out["precip_trace"] = trace
     return out
+
+
+def fill_short_gaps(df, cols, max_len):
+    """Linearly interpolate interior NaN runs of <= max_len rows in `cols` (in place).
+    Returns a boolean Series marking the rows that were filled."""
+    miss = df[cols[0]].isna()
+    run_len = miss.groupby((~miss).cumsum()).transform("sum")
+    short = miss & (run_len <= max_len)
+    interp = df[cols].interpolate(limit_area="inside")
+    df.loc[short, cols] = interp.loc[short, cols]
+    return short & df[cols[0]].notna()
+
+
+def clean_daily(daily):
+    # end on the last day with the official daily mean (today has only partial 15-min data)
+    last = daily.loc[daily["discharge_cfs_mean"].notna(), "date"].max()
+    daily = daily[daily["date"] <= last].copy()
+    # three 1938-43 NOAA days report Tmax < Tmin: source error, blank both
+    bad = daily["tmax_f"] < daily["tmin_f"]
+    daily.loc[bad, ["tmax_f", "tmin_f"]] = np.nan
+    daily["tmean_f"] = (daily["tmax_f"] + daily["tmin_f"]) / 2
+    daily = daily.drop(columns=[c for c in DROP_WEATHER if c in daily])
+    return daily.round({"discharge_cfs_15min_max": 1, "discharge_cfs_15min_mean": 1,
+                        "gage_height_ft_15min_max": 3, "gage_height_ft_15min_mean": 3,
+                        "wind_mph": 1})
 
 
 def build():
@@ -369,17 +404,32 @@ def build():
             continue
         s = pd.Series(pd.to_numeric(cv["value"], errors="coerce").values,
                       index=pd.to_datetime(cv["time"], utc=True, format="ISO8601")).sort_index()
-        h = s.resample("1h").agg(["mean", "max"]).add_prefix(f"{name}_")
-        hourly_parts.append(h.dropna(how="all"))  # skip hours/days inside data gaps
-        d = s.tz_convert(LOCAL_STD_TZ).resample("1D").agg(["max", "mean"])
-        d = d.add_prefix(f"{name}_15min_").dropna(how="all")
+        s = s.dropna()
+        hourly_parts.append(s.resample("1h").agg(["mean", "max"]).add_prefix(f"{name}_"))
+        local = s.tz_convert(LOCAL_STD_TZ)
+        d = local.resample("1D").agg(["max", "mean"])
+        # partial days (gap edges, today) give biased max/mean: keep only well-covered days
+        hours = local.resample("1h").count().gt(0).resample("1D").sum()
+        d = d[hours.reindex(d.index, fill_value=0) >= MIN_HOURS_PER_DAY]
+        d = d.add_prefix(f"{name}_15min_")
         d.index = d.index.date
         dagg_parts.append(d)
     if hourly_parts:
         hourly = pd.concat(hourly_parts, axis=1)
+        hourly = hourly[hourly.index >= pd.Timestamp(HOURLY_START, tz="UTC")]
+        # regular hourly grid: every hour present, so fixed-length sequences line up
+        grid = pd.date_range(hourly.index.min(), hourly.index.max(), freq="1h")
+        hourly = hourly.reindex(grid)
+        for name, _ in CONTINUOUS_PARAMS.values():
+            cols = [f"{name}_mean", f"{name}_max"]
+            hourly[f"{name}_filled"] = fill_short_gaps(hourly, cols, MAX_FILL_HOURS)
+        hourly = hourly.round({"discharge_cfs_mean": 1, "discharge_cfs_max": 1,
+                               "gage_height_ft_mean": 3, "gage_height_ft_max": 3})
         hourly.index.name = "time_utc"
         hourly.to_csv(PROC / "hourly_flow.csv")
-        log.info("wrote hourly_flow.csv (%d rows)", len(hourly))
+        log.info("wrote hourly_flow.csv (%d rows, %s..%s, %d hours still missing discharge)",
+                 len(hourly), hourly.index.min(), hourly.index.max(),
+                 hourly["discharge_cfs_mean"].isna().sum())
 
     # weather + 15-min daily aggregates, all outer-joined on date
     daily = daily.merge(weather_frame(read_raw("noaa_logan_daily.csv")), on="date", how="outer")
@@ -387,6 +437,7 @@ def build():
         daily = daily.merge(d, left_on="date", right_index=True, how="outer")
 
     daily = daily.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    daily = clean_daily(daily)
     daily = daily.reindex(columns=DAILY_COLUMNS)  # same columns even if a source is missing
     dt = pd.to_datetime(daily["date"])
     doy = dt.dt.dayofyear
